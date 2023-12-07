@@ -1104,6 +1104,9 @@ extern "C" {
     ) -> ::std::os::raw::c_int;
 }
 extern "C" {
+    pub fn sqlite3_wal_backfilled(pWal: *mut sqlite3_wal) -> ::std::os::raw::c_int;
+}
+extern "C" {
     pub fn libsql_try_initialize_wasm_func_table(db: *mut sqlite3) -> ::std::os::raw::c_int;
 }
 extern "C" {
@@ -3325,6 +3328,16 @@ pub struct libsql_wal_methods {
             zBuf: *mut ::std::os::raw::c_uchar,
             pnLog: *mut ::std::os::raw::c_int,
             pnCkpt: *mut ::std::os::raw::c_int,
+            pCbData: *mut ::std::os::raw::c_void,
+            xCb: ::std::option::Option<
+                unsafe extern "C" fn(
+                    arg1: *mut ::std::os::raw::c_void,
+                    arg2: *const ::std::os::raw::c_uchar,
+                    arg3: ::std::os::raw::c_int,
+                    arg4: ::std::os::raw::c_int,
+                    arg5: ::std::os::raw::c_int,
+                ) -> ::std::os::raw::c_int,
+            >,
         ) -> ::std::os::raw::c_int,
     >,
     pub xCallback:

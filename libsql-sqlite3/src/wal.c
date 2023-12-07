@@ -265,10 +265,18 @@ static int sqlite3WalCheckpoint(
   int nBuf,                       /* Size of temporary buffer */
   u8 *zBuf,                       /* Temporary buffer to use */
   int *pnLog,                     /* OUT: Number of frames in WAL */
-  int *pnCkpt                     /* OUT: Number of backfilled frames in WAL */
+  int *pnCkpt,                    /* OUT: Number of backfilled frames in WAL */
+  void *pCbData,
+  int (*xCb)(void*, const unsigned char*, int, int, int)       /* page, page_no, frame_no */
 );
 static void sqlite3WalEndReadTransaction(Wal *pWal);
 static int sqlite3WalEndWriteTransaction(Wal *pWal);
+static int walFindFrame(
+  Wal *pWal,                      /* WAL handle */
+  Pgno pgno,                      /* Database page number to read data for */
+  u32 iLast,
+  u32 *piRead                     /* OUT: Frame number (or zero) */
+);
 
 /*
 ** Trace output macros
@@ -529,6 +537,11 @@ struct WalIterator {
     int nEntry;                   /* Nr. of entries in aPgno[] and aIndex[] */
     int iZero;                    /* Frame number associated with aPgno[0] */
   } aSegment[1];                  /* One for every 32KB page in the wal-index */
+};
+
+struct WalIteratorRev {
+    u32 current;
+    u32 *frames;
 };
 
 /*
@@ -1501,6 +1514,27 @@ static int walIteratorNext(
   return (iRet==0xFFFFFFFF);
 }
 
+static int walIteratorRevNext(
+  struct WalIteratorRev *p,               /* Iterator */
+  u32 *piPage,                  /* OUT: The page number of the next page */
+  u32 *piFrame                  /* OUT: Wal frame index of next page */
+){
+    while (p->current > 0 && p->frames[p->current] == 0) {
+        p->current -= 1;
+    }
+
+    if (p->current == 0) {
+        return 1;
+    }
+
+    *piFrame = p->current;
+    *piPage = p->frames[p->current];
+
+    p->current--;
+
+    return 0;
+}
+
 /*
 ** This function merges two sorted lists into a single sorted list.
 **
@@ -1727,6 +1761,36 @@ static int walIteratorInit(Wal *pWal, u32 nBackfill, WalIterator **pp){
   return rc;
 }
 
+static int walIteratorRevInit(Wal *pWal, u32 nBackfill, struct WalIteratorRev *p){
+    WalIterator *pIter;
+    u32 *frames;
+    u32 iFrame, iPageno;
+    int rc;
+
+    frames = (u32*)sqlite3MallocZero((pWal->hdr.mxFrame + 1) * sizeof(u32));
+    if (!frames) return SQLITE_NOMEM_BKPT;
+    rc = walIteratorInit(pWal, nBackfill, &pIter);
+    if (rc || !pIter) {
+        sqlite3_free(frames);
+        return rc;
+    }
+
+    while (walIteratorNext(pIter, &iPageno, &iFrame) == 0) {
+        frames[iFrame] = iPageno;
+    }
+    walIteratorFree(pIter);
+
+    p->current = pWal->hdr.mxFrame;
+    p->frames = frames;
+
+    return SQLITE_OK;
+}
+
+static void walIteratorRevFree(struct WalIteratorRev *p) {
+    p->current = 0;
+    sqlite3_free(p->frames);
+}
+
 #ifdef SQLITE_ENABLE_SETLK_TIMEOUT
 /*
 ** Attempt to enable blocking locks. Blocking locks are enabled only if (a)
@@ -1915,11 +1979,14 @@ static int walCheckpoint(
   int (*xBusy)(void*),            /* Function to call when busy */
   void *pBusyArg,                 /* Context argument for xBusyHandler */
   int sync_flags,                 /* Flags for OsSync() (or 0) */
-  u8 *zBuf                        /* Temporary buffer to use */
+  u8 *zBuf,                       /* Temporary buffer to use */
+  int nBuf,
+  void *pCbData,
+  int (*xCb)(void*, const unsigned char*, int, int, int)       /* page, page_no, frame_no */
 ){
   int rc = SQLITE_OK;             /* Return code */
   int szPage;                     /* Database page-size */
-  WalIterator *pIter = 0;         /* Wal iterator context */
+  struct WalIteratorRev pIter = { 0 };         /* Wal iterator context */
   u32 iDbpage = 0;                /* Next database page to write */
   u32 iFrame = 0;                 /* Wal frame containing data for iDbpage */
   u32 mxSafeFrame;                /* Max frame that can be backfilled */
@@ -1949,6 +2016,7 @@ static int walCheckpoint(
       if( mxSafeFrame>y ){
         assert( y<=pWal->hdr.mxFrame );
         rc = walBusyLock(pWal, xBusy, pBusyArg, WAL_READ_LOCK(i), 1);
+
         if( rc==SQLITE_OK ){
           u32 iMark = (i==1 ? mxSafeFrame : READMARK_NOT_USED);
           AtomicStore(pInfo->aReadMark+i, iMark); SEH_INJECT_FAULT;
@@ -1964,13 +2032,10 @@ static int walCheckpoint(
 
     /* Allocate the iterator */
     if( pInfo->nBackfill<mxSafeFrame ){
-      rc = walIteratorInit(pWal, pInfo->nBackfill, &pIter);
-      assert( rc==SQLITE_OK || pIter==0 );
+      rc = walIteratorRevInit(pWal, pInfo->nBackfill, &pIter);
     }
 
-    if( pIter
-     && (rc = walBusyLock(pWal,xBusy,pBusyArg,WAL_READ_LOCK(0),1))==SQLITE_OK
-    ){
+    if((rc = walBusyLock(pWal,xBusy,pBusyArg,WAL_READ_LOCK(0),1))==SQLITE_OK){
       u32 nBackfill = pInfo->nBackfill;
       pInfo->nBackfillAttempted = mxSafeFrame; SEH_INJECT_FAULT;
 
@@ -2000,7 +2065,7 @@ static int walCheckpoint(
       }
 
       /* Iterate through the contents of the WAL, copying data to the db file */
-      while( rc==SQLITE_OK && 0==walIteratorNext(pIter, &iDbpage, &iFrame) ){
+      while( rc==SQLITE_OK && 0==walIteratorRevNext(&pIter, &iDbpage, &iFrame) ){
         i64 iOffset;
         assert( walFramePgno(pWal, iFrame)==iDbpage );
         SEH_INJECT_FAULT;
@@ -2008,23 +2073,49 @@ static int walCheckpoint(
           rc = db->mallocFailed ? SQLITE_NOMEM_BKPT : SQLITE_INTERRUPT;
           break;
         }
-        if( iFrame<=nBackfill || iFrame>mxSafeFrame || iDbpage>mxPage ){
+
+        if( iFrame<=nBackfill || iDbpage>mxPage ){
           continue;
         }
+
+        int read_alt_page = 0;
+        if (iFrame > mxSafeFrame ) {
+           rc = walFindFrame(pWal, iDbpage, mxSafeFrame, &iFrame);
+           if( rc!=SQLITE_OK ) break;
+           if (iFrame == 0) {
+               continue;
+           }
+           read_alt_page = 1;
+        }
+
         iOffset = walFrameOffset(iFrame, szPage) + WAL_FRAME_HDRSIZE;
         /* testcase( IS_BIG_INT(iOffset) ); // requires a 4GiB WAL file */
-        rc = sqlite3OsRead(pWal->pWalFd, zBuf, szPage, iOffset);
-        if( rc!=SQLITE_OK ) break;
-        iOffset = (iDbpage-1)*(i64)szPage;
-        testcase( IS_BIG_INT(iOffset) );
-        rc = sqlite3OsWrite(pWal->pDbFd, zBuf, szPage, iOffset);
-        if( rc!=SQLITE_OK ) break;
+        if (read_alt_page == 0 || xCb) {
+            rc = sqlite3OsRead(pWal->pWalFd, zBuf, szPage, iOffset);
+            if( rc!=SQLITE_OK ) break;
+            iOffset = (iDbpage-1)*(i64)szPage;
+            testcase( IS_BIG_INT(iOffset) );
+            /* sqlite in not expecting this page to be checkpointed, but we do,
+             * so we call the callback, but do not write it to the main db file
+             * */
+            if (!read_alt_page) {
+                rc = sqlite3OsWrite(pWal->pDbFd, zBuf, szPage, iOffset);
+                if( rc!=SQLITE_OK ) break;
+            }
+            if (xCb) {
+                rc = (xCb)(pCbData, zBuf, nBuf, iDbpage, iFrame);
+            }
+            if( rc!=SQLITE_OK ) break;
+        }
       }
       sqlite3OsFileControl(pWal->pDbFd, SQLITE_FCNTL_CKPT_DONE, 0);
 
       /* If work was actually accomplished... */
       if( rc==SQLITE_OK ){
         if( mxSafeFrame==walIndexHdr(pWal)->mxFrame ){
+          if (xCb) {
+              rc = (xCb)(pCbData, NULL, 0, 0, 0);
+          }
           i64 szDb = pWal->hdr.nPage*(i64)szPage;
           testcase( IS_BIG_INT(szDb) );
           rc = sqlite3OsTruncate(pWal->pDbFd, szDb);
@@ -2088,7 +2179,7 @@ static int walCheckpoint(
 
  walcheckpoint_out:
   SEH_FREE_ON_ERROR(pIter, 0);
-  walIteratorFree(pIter);
+  walIteratorRevFree(&pIter);
   return rc;
 }
 
@@ -2148,7 +2239,7 @@ static int sqlite3WalClose(
         pWal->exclusiveMode = WAL_EXCLUSIVE_MODE;
       }
       rc = sqlite3WalCheckpoint(pWal, db, 
-          SQLITE_CHECKPOINT_PASSIVE, 0, 0, sync_flags, nBuf, zBuf, 0, 0
+          SQLITE_CHECKPOINT_PASSIVE, 0, 0, sync_flags, nBuf, zBuf, 0, 0, NULL, NULL
       );
       if( rc==SQLITE_OK ){
         int bPersist = -1;
@@ -3058,10 +3149,10 @@ static void sqlite3WalEndReadTransaction(Wal *pWal){
 static int walFindFrame(
   Wal *pWal,                      /* WAL handle */
   Pgno pgno,                      /* Database page number to read data for */
+  u32 iLast,
   u32 *piRead                     /* OUT: Frame number (or zero) */
 ){
   u32 iRead = 0;                  /* If !=0, WAL frame to return data from */
-  u32 iLast = pWal->hdr.mxFrame;  /* Last page in WAL for this reader */
   int iHash;                      /* Used to loop through N hash tables */
   int iMinHash;
 
@@ -3173,7 +3264,7 @@ int sqlite3WalFindFrame(
 ){
   int rc;
   SEH_TRY {
-    rc = walFindFrame(pWal, pgno, piRead);
+    rc = walFindFrame(pWal, pgno, pWal->hdr.mxFrame, piRead);
   }
   SEH_EXCEPT( rc = SQLITE_IOERR_IN_PAGE; )
   return rc;
@@ -3206,6 +3297,7 @@ static int sqlite3WalReadFrame(
 */
 static Pgno sqlite3WalDbsize(Wal *pWal){
   if( pWal && ALWAYS(pWal->readLock>=0) ){
+
     return pWal->hdr.nPage;
   }
   return 0;
@@ -3833,7 +3925,9 @@ static int sqlite3WalCheckpoint(
   int nBuf,                       /* Size of temporary buffer */
   u8 *zBuf,                       /* Temporary buffer to use */
   int *pnLog,                     /* OUT: Number of frames in WAL */
-  int *pnCkpt                     /* OUT: Number of backfilled frames in WAL */
+  int *pnCkpt,                    /* OUT: Number of backfilled frames in WAL */
+  void *pCbData,
+  int (*xCb)(void*, const unsigned char*, int, int, int)       /* page, page_no, frame_no */
 ){
   int rc;                         /* Return code */
   int isChanged = 0;              /* True if a new wal-index header is loaded */
@@ -3907,7 +4001,7 @@ static int sqlite3WalCheckpoint(
       if( pWal->hdr.mxFrame && walPagesize(pWal)!=nBuf ){
         rc = SQLITE_CORRUPT_BKPT;
       }else{
-        rc = walCheckpoint(pWal, db, eMode2, xBusy2, pBusyArg, sync_flags,zBuf);
+        rc = walCheckpoint(pWal, db, eMode2, xBusy2, pBusyArg, sync_flags,zBuf, nBuf, pCbData, xCb);
       }
 
       /* If no error occurred, set the output variables. */
@@ -4311,7 +4405,7 @@ static int sqlite3WalOpen(
     out->methods.xSavepoint = (void (*)(wal_impl *, unsigned int *))sqlite3WalSavepoint;
     out->methods.xSavepointUndo = (int (*)(wal_impl *, unsigned int *))sqlite3WalSavepointUndo;
     out->methods.xFrames = (int (*)(wal_impl *, int, libsql_pghdr *, unsigned int, int, int))sqlite3WalFrames;
-    out->methods.xCheckpoint = (int (*)(wal_impl *, sqlite3 *, int, int (*)(void *), void *, int, int, unsigned char *, int *, int *))sqlite3WalCheckpoint;
+    out->methods.xCheckpoint = (int (*)(wal_impl *, sqlite3 *, int, int (*)(void *), void *, int, int, unsigned char *, int *, int *, void*, int (*)(void*, const unsigned char*, int, int, int)))sqlite3WalCheckpoint;
     out->methods.xCallback = (int (*)(wal_impl *))sqlite3WalCallback;
     out->methods.xExclusiveMode = (int (*)(wal_impl *, int))sqlite3WalExclusiveMode;
     out->methods.xHeapMemory = (int (*)(wal_impl *))sqlite3WalHeapMemory;
@@ -4404,5 +4498,9 @@ RefCountedWalManager *make_sqlite3_wal_manager_rc() {
 }
 
 typedef struct wal_impl wal_impl;
+
+int sqlite3_wal_backfilled(sqlite3_wal *pWal) {
+  return walCkptInfo(pWal)->nBackfill;
+}
 
 #endif /* #ifndef SQLITE_OMIT_WAL */

@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex};
 use libsql_sys::ffi::{SQLITE_BUSY, SQLITE_IOERR_WRITE};
 use libsql_sys::wal::{
     CheckpointMode, Error, PageHeaders, Result, Sqlite3Db, Sqlite3File, UndoHandler, Vfs, Wal,
-    WalManager,
+    WalManager, CheckpointCallback, BusyHandler,
 };
 
 use crate::replicator::Replicator;
@@ -163,7 +163,7 @@ impl<T: Wal> Wal for BottomlessWal<T> {
         is_commit: bool,
         sync_flags: c_int,
     ) -> Result<()> {
-        let last_valid_frame = self.inner.last_fame_index();
+        let last_valid_frame = self.inner.last_fame_index().map(|x| x.get()).unwrap_or(0);
 
         self.inner
             .insert_frames(page_size, page_headers, size_after, is_commit, sync_flags)?;
@@ -174,21 +174,22 @@ impl<T: Wal> Wal for BottomlessWal<T> {
                 std::process::abort()
             }
             replicator.register_last_valid_frame(last_valid_frame);
-            let new_valid_valid_frame_index = self.inner.last_fame_index();
+            let new_valid_valid_frame_index = self.inner.last_fame_index().map(|x| x.get()).unwrap_or(0);
             replicator.submit_frames(new_valid_valid_frame_index - last_valid_frame);
         })?;
 
         Ok(())
     }
 
-    fn checkpoint<B: libsql_sys::wal::BusyHandler>(
+    fn checkpoint(
         &mut self,
         db: &mut Sqlite3Db,
         mode: CheckpointMode,
-        busy_handler: Option<&mut B>,
+        busy_handler: Option<&mut dyn BusyHandler>,
         sync_flags: u32,
         // temporary scratch buffer
         buf: &mut [u8],
+        checkpoint_cb: Option<&mut dyn CheckpointCallback>,
     ) -> Result<(u32, u32)> {
         {
             tracing::trace!("bottomless checkpoint");
@@ -243,7 +244,7 @@ impl<T: Wal> Wal for BottomlessWal<T> {
 
         let ret = self
             .inner
-            .checkpoint(db, mode, busy_handler, sync_flags, buf)?;
+            .checkpoint(db, mode, busy_handler, sync_flags, buf, checkpoint_cb)?;
 
         #[allow(clippy::await_holding_lock)]
         // uncontended -> only gets called under a libSQL write lock
@@ -280,7 +281,15 @@ impl<T: Wal> Wal for BottomlessWal<T> {
         self.inner.callback()
     }
 
-    fn last_fame_index(&self) -> u32 {
+    fn last_fame_index(&self) -> Option<NonZeroU32> {
         self.inner.last_fame_index()
+    }
+
+    fn db_file(&self) -> &Sqlite3File {
+        self.inner.db_file()
+    }
+
+    fn count_checkpointed(&self) -> u32 {
+        self.inner.count_checkpointed()
     }
 }

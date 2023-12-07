@@ -412,7 +412,7 @@ impl SnapshotMerger {
 }
 
 /// An utility to build a snapshots from log frames
-struct SnapshotBuilder {
+pub struct SnapshotBuilder {
     seen_pages: HashSet<u32>,
     header: SnapshotFileHeader,
     snapshot_file: tokio::io::BufWriter<async_tempfile::TempFile>,
@@ -425,7 +425,7 @@ fn snapshot_dir_path(db_path: &Path) -> PathBuf {
 }
 
 impl SnapshotBuilder {
-    async fn new(db_path: &Path, log_id: Uuid) -> anyhow::Result<Self> {
+    pub async fn new(db_path: &Path, log_id: Uuid) -> anyhow::Result<Self> {
         let snapshot_dir_path = snapshot_dir_path(db_path);
         std::fs::create_dir_all(&snapshot_dir_path)?;
         let mut f =
@@ -491,7 +491,7 @@ impl SnapshotBuilder {
     }
 
     /// Persist the snapshot, and returns the name and size is frame on the snapshot.
-    async fn finish(mut self) -> anyhow::Result<(String, u64, u32)> {
+    pub async fn finish(mut self) -> anyhow::Result<(String, u64, u32)> {
         self.snapshot_file.flush().await?;
         let mut file = self.snapshot_file.into_inner();
         file.seek(SeekFrom::Start(0)).await?;

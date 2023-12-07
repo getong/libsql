@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use libsql_sys::wal::wrapper::{WalWrapper, WrapWal, WrappedWal};
-use libsql_sys::wal::{Wal, WalManager};
+use libsql_sys::wal::{Wal, WalManager, CheckpointCallback, BusyHandler};
 use metrics::{histogram, increment_counter};
 use parking_lot::{Mutex, RwLock};
 use rusqlite::ffi::SQLITE_BUSY;
@@ -170,14 +170,15 @@ impl<T> std::fmt::Debug for LibSqlConnection<T> {
 pub struct InhibitCheckpointWalWrapper;
 
 impl<W: Wal> WrapWal<W> for InhibitCheckpointWalWrapper {
-    fn checkpoint<B: libsql_sys::wal::BusyHandler>(
+    fn checkpoint(
         &mut self,
         _wrapped: &mut W,
         _db: &mut libsql_sys::wal::Sqlite3Db,
         _mode: libsql_sys::wal::CheckpointMode,
-        _busy_handler: Option<&mut B>,
+        _busy_handler: Option<&mut dyn BusyHandler>,
         _sync_flags: u32,
         _buf: &mut [u8],
+        _checkpoint_cb: Option<&mut dyn CheckpointCallback>,
     ) -> libsql_sys::wal::Result<(u32, u32)> {
         tracing::warn!(
             "chackpoint inhibited: this connection is not allowed to perform checkpoints"
@@ -186,7 +187,7 @@ impl<W: Wal> WrapWal<W> for InhibitCheckpointWalWrapper {
     }
 
     fn close<M: WalManager<Wal = W>>(
-        &self,
+        &mut self,
         manager: &M,
         wrapped: &mut W,
         db: &mut libsql_sys::wal::Sqlite3Db,
@@ -226,7 +227,7 @@ where
 }
 
 /// Same as open_conn, but with checkpointing activated.
-pub fn open_conn_active_checkpoint<T>(
+pub fn open_conn_enable_checkpoint<T>(
     path: &Path,
     wal_manager: T,
     flags: Option<OpenFlags>,
@@ -506,7 +507,7 @@ impl<W: Wal> Connection<W> {
         state: Arc<TxnState<W>>,
     ) -> Result<Self> {
         let conn =
-            open_conn_active_checkpoint(path, wal_manager, None, builder_config.auto_checkpoint)?;
+            open_conn_enable_checkpoint(path, wal_manager, None, builder_config.auto_checkpoint)?;
 
         // register the lock-stealing busy handler
         unsafe {

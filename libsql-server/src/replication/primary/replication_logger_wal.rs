@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use libsql_sys::ffi::Sqlite3DbHeader;
-use libsql_sys::wal::{BusyHandler, Result, Sqlite3Wal, Sqlite3WalManager, WalManager};
+use libsql_sys::wal::{BusyHandler, Result, Sqlite3Wal, Sqlite3WalManager, WalManager, CheckpointCallback};
 use libsql_sys::wal::{PageHeaders, Sqlite3Db, Sqlite3File, UndoHandler};
 use libsql_sys::wal::{Vfs, Wal};
 use rusqlite::ffi::{libsql_pghdr, SQLITE_IOERR, SQLITE_SYNC_NORMAL};
@@ -222,17 +222,18 @@ impl Wal for ReplicationLoggerWal {
         Ok(())
     }
 
-    fn checkpoint<B: BusyHandler>(
+    fn checkpoint(
         &mut self,
         db: &mut Sqlite3Db,
         mode: libsql_sys::wal::CheckpointMode,
-        busy_handler: Option<&mut B>,
+        busy_handler: Option<&mut dyn BusyHandler>,
         sync_flags: u32,
         buf: &mut [u8],
+        checkpoint_cb: Option<&mut dyn CheckpointCallback>,
     ) -> Result<(u32, u32)> {
         self.inject_replication_index()?;
         self.inner
-            .checkpoint(db, mode, busy_handler, sync_flags, buf)
+            .checkpoint(db, mode, busy_handler, sync_flags, buf, checkpoint_cb)
     }
 
     fn exclusive_mode(&mut self, op: c_int) -> Result<()> {
@@ -251,8 +252,16 @@ impl Wal for ReplicationLoggerWal {
         self.inner.callback()
     }
 
-    fn last_fame_index(&self) -> u32 {
+    fn last_fame_index(&self) -> Option<NonZeroU32> {
         self.inner.last_fame_index()
+    }
+
+    fn db_file(&self) -> &Sqlite3File {
+        self.inner.db_file()
+    }
+
+    fn count_checkpointed(&self) -> u32 {
+        self.inner.count_checkpointed()
     }
 }
 
@@ -328,17 +337,17 @@ mod test {
         struct VerifyReplicationIndex(Arc<AtomicU64>);
 
         impl WrapWal<ReplicationLoggerWal> for VerifyReplicationIndex {
-            fn checkpoint<B: libsql_sys::wal::BusyHandler>(
+            fn checkpoint(
                 &mut self,
                 wrapped: &mut ReplicationLoggerWal,
                 db: &mut libsql_sys::wal::Sqlite3Db,
                 mode: libsql_sys::wal::CheckpointMode,
-                busy_handler: Option<&mut B>,
+                busy_handler: Option<&mut dyn BusyHandler>,
                 sync_flags: u32,
-                // temporary scratch buffer
                 buf: &mut [u8],
+                checkpoint_cb: Option<&mut dyn CheckpointCallback>
             ) -> libsql_sys::wal::Result<(u32, u32)> {
-                let ret = wrapped.checkpoint(db, mode, busy_handler, sync_flags, buf)?;
+                let ret = wrapped.checkpoint(db, mode, busy_handler, sync_flags, buf, checkpoint_cb)?;
                 let buf = &mut [0; LIBSQL_PAGE_SIZE as _];
                 wrapped.inner.db_file().read_at(buf, 0).unwrap();
                 let header = Sqlite3DbHeader::mut_from_prefix(buf).unwrap();
@@ -368,7 +377,7 @@ mod test {
             verify_replication_index.clone(),
             ReplicationLoggerWalManager::new(logger.clone()),
         );
-        let db = crate::connection::libsql::open_conn_active_checkpoint(
+        let db = crate::connection::libsql::open_conn_enable_checkpoint(
             tmp.path(),
             wal_manager,
             None,
@@ -416,7 +425,7 @@ mod test {
         );
 
         let wal_manager = ReplicationLoggerWalManager::new(logger.clone());
-        let db = crate::connection::libsql::open_conn_active_checkpoint(
+        let db = crate::connection::libsql::open_conn_enable_checkpoint(
             tmp.path(),
             wal_manager,
             None,

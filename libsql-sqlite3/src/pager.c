@@ -7535,7 +7535,7 @@ int sqlite3PagerCheckpoint(
         (eMode==SQLITE_CHECKPOINT_PASSIVE ? 0 : pPager->xBusyHandler),
         pPager->pBusyHandlerArg,
         pPager->walSyncFlags, pPager->pageSize, (u8 *)pPager->pTmpSpace,
-        pnLog, pnCkpt
+        pnLog, pnCkpt, NULL, NULL
     );
   }
   return rc;

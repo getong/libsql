@@ -1,6 +1,6 @@
 use std::{ffi::c_int, num::NonZeroU32};
 
-use super::{Wal, WalManager};
+use super::{BusyHandler, CheckpointCallback, Wal, WalManager};
 
 /// A convenient wrapper struct that implement WAL with a `wrapper` where the wrapper needs to
 /// implement `WrapWal` instead of `Wal`, where all methods delegate to wrapped by default.
@@ -17,6 +17,7 @@ where
     pub fn new(wrapper: T, wrapped: W) -> Self {
         Self { wrapper, wrapped }
     }
+
 }
 
 pub struct WrappedWal<T, W> {
@@ -60,6 +61,7 @@ where
         scratch: Option<&mut [u8]>,
     ) -> super::Result<()> {
         self.wrapper
+            .clone()
             .close(&self.wrapped, &mut wal.wrapped, db, sync_flags, scratch)
     }
 
@@ -147,17 +149,25 @@ where
         )
     }
 
-    fn checkpoint<B: super::BusyHandler>(
+    fn checkpoint(
         &mut self,
         db: &mut super::Sqlite3Db,
         mode: super::CheckpointMode,
-        busy_handler: Option<&mut B>,
+        busy_handler: Option<&mut dyn BusyHandler>,
         sync_flags: u32,
         // temporary scratch buffer
         buf: &mut [u8],
+        checkpoint_cb: Option<&mut dyn CheckpointCallback>,
     ) -> super::Result<(u32, u32)> {
-        self.wrapper
-            .checkpoint(&mut self.wrapped, db, mode, busy_handler, sync_flags, buf)
+        self.wrapper.checkpoint(
+            &mut self.wrapped,
+            db,
+            mode,
+            busy_handler,
+            sync_flags,
+            buf,
+            checkpoint_cb,
+        )
     }
 
     fn exclusive_mode(&mut self, op: std::ffi::c_int) -> super::Result<()> {
@@ -176,8 +186,16 @@ where
         self.wrapper.callback(&self.wrapped)
     }
 
-    fn last_fame_index(&self) -> u32 {
+    fn last_fame_index(&self) -> Option<NonZeroU32> {
         self.wrapper.last_fame_index(&self.wrapped)
+    }
+
+    fn db_file(&self) -> &super::Sqlite3File {
+        self.wrapped.db_file()
+    }
+
+    fn count_checkpointed(&self) -> u32 {
+        self.wrapped.count_checkpointed()
     }
 }
 
@@ -253,17 +271,18 @@ pub trait WrapWal<W: Wal> {
         wrapped.insert_frames(page_size, page_headers, size_after, is_commit, sync_flags)
     }
 
-    fn checkpoint<B: super::BusyHandler>(
+    fn checkpoint(
         &mut self,
         wrapped: &mut W,
         db: &mut super::Sqlite3Db,
         mode: super::CheckpointMode,
-        busy_handler: Option<&mut B>,
+        busy_handler: Option<&mut dyn BusyHandler>,
         sync_flags: u32,
         // temporary scratch buffer
         buf: &mut [u8],
+        checkpoint_cb: Option<&mut dyn CheckpointCallback>,
     ) -> super::Result<(u32, u32)> {
-        wrapped.checkpoint(db, mode, busy_handler, sync_flags, buf)
+        wrapped.checkpoint(db, mode, busy_handler, sync_flags, buf, checkpoint_cb)
     }
 
     fn exclusive_mode(&mut self, wrapped: &mut W, op: std::ffi::c_int) -> super::Result<()> {
@@ -282,12 +301,12 @@ pub trait WrapWal<W: Wal> {
         wrapped.callback()
     }
 
-    fn last_fame_index(&self, wrapped: &W) -> u32 {
+    fn last_fame_index(&self, wrapped: &W) -> Option<NonZeroU32> {
         wrapped.last_fame_index()
     }
 
     fn close<M: WalManager<Wal = W>>(
-        &self,
+        &mut self,
         manager: &M,
         wrapped: &mut W,
         db: &mut super::Sqlite3Db,

@@ -94,6 +94,9 @@ pub enum Error {
     NamespaceStoreShutdown,
     #[error("Unable to update metastore: {0}")]
     MetaStoreUpdateFailure(Box<dyn std::error::Error + Send + Sync>),
+    
+    #[error("Error processing snapshot file")]
+    SnapshotFileError(#[from] libsql_replication::snapshot::Error),
 }
 
 trait ResponseError: std::error::Error {
@@ -153,6 +156,7 @@ impl IntoResponse for Error {
             UrlParseError(_) => self.format_err(StatusCode::BAD_REQUEST),
             NamespaceStoreShutdown => self.format_err(StatusCode::SERVICE_UNAVAILABLE),
             MetaStoreUpdateFailure(_) => self.format_err(StatusCode::INTERNAL_SERVER_ERROR),
+            SnapshotFileError(_) => self.format_err(StatusCode::INTERNAL_SERVER_ERROR),
         }
     }
 }

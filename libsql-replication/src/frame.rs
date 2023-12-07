@@ -78,6 +78,12 @@ impl TryFrom<&[u8]> for FrameMut {
     }
 }
 
+impl From<Box<FrameBorrowed>> for FrameMut {
+    fn from(inner: Box<FrameBorrowed>) -> Self {
+        Self { inner }
+    }
+}
+
 impl From<FrameMut> for Frame {
     fn from(value: FrameMut) -> Self {
         // transmute the FrameBorrowed into a Box<[u8; _]>. This is safe because the alignment of
@@ -140,6 +146,10 @@ impl FrameBorrowed {
 
     pub fn header_mut(&mut self) -> &mut FrameHeader {
         &mut self.header
+    }
+
+    pub fn page_mut(&mut self) -> &mut [u8] {
+        &mut self.page
     }
 
     pub fn from_parts(header: &FrameHeader, page: &[u8]) -> Self {

@@ -8,7 +8,7 @@ use bottomless::{
 };
 use libsql_sys::wal::{
     BusyHandler, CheckpointMode, PageHeaders, Result, Sqlite3Db, Sqlite3File, UndoHandler, Vfs,
-    Wal, WalManager,
+    Wal, WalManager, CheckpointCallback,
 };
 
 use crate::replication::{
@@ -212,20 +212,21 @@ impl Wal for ReplicationWal {
         }
     }
 
-    fn checkpoint<B: BusyHandler>(
+    fn checkpoint(
         &mut self,
         db: &mut Sqlite3Db,
         mode: CheckpointMode,
-        busy_handler: Option<&mut B>,
+        busy_handler: Option<&mut dyn BusyHandler>,
         sync_flags: u32,
         buf: &mut [u8],
+        checkoint_cb: Option<&mut dyn CheckpointCallback>
     ) -> Result<(u32, u32)> {
         match self {
             ReplicationWal::Bottomless(inner) => {
-                inner.checkpoint(db, mode, busy_handler, sync_flags, buf)
+                inner.checkpoint(db, mode, busy_handler, sync_flags, buf, checkoint_cb)
             }
             ReplicationWal::Logger(inner) => {
-                inner.checkpoint(db, mode, busy_handler, sync_flags, buf)
+                inner.checkpoint(db, mode, busy_handler, sync_flags, buf, checkoint_cb)
             }
         }
     }
@@ -258,10 +259,24 @@ impl Wal for ReplicationWal {
         }
     }
 
-    fn last_fame_index(&self) -> u32 {
+    fn last_fame_index(&self) -> Option<NonZeroU32> {
         match self {
             ReplicationWal::Bottomless(inner) => inner.last_fame_index(),
             ReplicationWal::Logger(inner) => inner.last_fame_index(),
+        }
+    }
+
+    fn db_file(&self) -> &Sqlite3File {
+        match self {
+            ReplicationWal::Bottomless(inner) => inner.db_file(),
+            ReplicationWal::Logger(inner) => inner.db_file(),
+        }
+    }
+
+    fn count_checkpointed(&self) -> u32 {
+        match self {
+            ReplicationWal::Bottomless(inner) => inner.count_checkpointed(),
+            ReplicationWal::Logger(inner) => inner.count_checkpointed(),
         }
     }
 }

@@ -1,16 +1,16 @@
 use std::ffi::{c_int, c_void, CStr};
-use std::mem::MaybeUninit;
+use std::mem::{size_of, MaybeUninit};
 use std::num::NonZeroU32;
 use std::ptr::null_mut;
 
 use libsql_ffi::{
-    libsql_wal, libsql_wal_manager, sqlite3_wal, sqlite3_wal_manager, Error, SQLITE_OK,
-    WAL_SAVEPOINT_NDATA,
+    libsql_wal, libsql_wal_manager, sqlite3_wal, sqlite3_wal_manager, Error, WalCkptInfo,
+    WalIndexHdr, SQLITE_OK, WAL_SAVEPOINT_NDATA,
 };
 
 use super::{
     BusyHandler, CheckpointMode, PageHeaders, Result, Sqlite3Db, Sqlite3File, UndoHandler, Vfs,
-    Wal, WalManager,
+    Wal, WalManager, CheckpointCallback,
 };
 
 /// SQLite3 default wal_manager implementation.
@@ -147,11 +147,40 @@ pub struct Sqlite3Wal {
 }
 
 impl Sqlite3Wal {
-    pub fn db_file(&mut self) -> &mut Sqlite3File {
-        unsafe {
-            let ptr = &mut (*(self.inner.pData as *mut sqlite3_wal)).pDbFd;
-            std::mem::transmute(ptr)
-        }
+    /// ported from wal.c
+    /// returns the page_no corresponding to a given frame_no
+    pub fn frame_page_no(&self, frame_no: NonZeroU32) -> Option<NonZeroU32> {
+        let wal = unsafe { &*(self.inner.pData as *const sqlite3_wal) };
+        let frame_no = frame_no.get();
+        const HASHTABLE_NPAGE: u32 = 4096;
+        const WALINDEX_HDR_SIZE: u32 =
+            size_of::<WalIndexHdr>() as u32 * 2 + size_of::<WalCkptInfo>() as u32;
+        const HASHTABLE_NPAGE_ONE: u32 =
+            HASHTABLE_NPAGE - (WALINDEX_HDR_SIZE / size_of::<u32>() as u32);
+
+        let hash = (frame_no + HASHTABLE_NPAGE - HASHTABLE_NPAGE_ONE - 1) / HASHTABLE_NPAGE;
+        debug_assert!(
+            (hash == 0 || frame_no > HASHTABLE_NPAGE_ONE)
+                && (hash >= 1 || frame_no <= HASHTABLE_NPAGE_ONE)
+                && (hash <= 1 || frame_no > (HASHTABLE_NPAGE_ONE + HASHTABLE_NPAGE))
+                && (hash >= 2 || frame_no <= HASHTABLE_NPAGE_ONE + HASHTABLE_NPAGE)
+                && (hash <= 2 || frame_no > (HASHTABLE_NPAGE_ONE + 2 * HASHTABLE_NPAGE))
+        );
+
+        let pno = unsafe {
+            if hash == 0 {
+                *(*(wal.apWiData.offset(0)).offset(
+                    (WALINDEX_HDR_SIZE as usize / size_of::<u32>() + frame_no as usize - 1) as _,
+                ))
+            } else {
+                *(*(wal.apWiData.offset(hash as _)).offset(
+                    ((frame_no as usize - 1 - HASHTABLE_NPAGE_ONE as usize)
+                        % HASHTABLE_NPAGE as usize) as _,
+                ))
+            }
+        };
+
+        NonZeroU32::new(pno)
     }
 }
 
@@ -220,8 +249,7 @@ impl Wal for Sqlite3Wal {
         let rc = unsafe { (self.inner.methods.xBeginWriteTransaction.unwrap())(self.inner.pData) };
         if rc != 0 {
             Err(Error::new(rc))
-        } else {
-            Ok(())
+        } else { Ok(())
         }
     }
 
@@ -306,26 +334,45 @@ impl Wal for Sqlite3Wal {
         }
     }
 
-    fn checkpoint<B: BusyHandler>(
+    fn checkpoint(
         &mut self,
         db: &mut Sqlite3Db,
         mode: CheckpointMode,
-        busy_handler: Option<&mut B>,
+        mut busy_handler: Option<&mut dyn BusyHandler>,
         sync_flags: u32,
         // temporary scratch buffer
         buf: &mut [u8],
+        mut checkpoint_cb: Option<&mut dyn CheckpointCallback>,
     ) -> Result<(u32, u32)> {
-        unsafe extern "C" fn call_handler<B: BusyHandler>(p: *mut c_void) -> c_int {
-            let this = &mut *(p as *mut B);
+        unsafe extern "C" fn call_handler(p: *mut c_void) -> c_int {
+            let this = &mut *(p as *mut &mut dyn BusyHandler);
             this.handle_busy() as _
+        }
+
+        unsafe extern "C" fn call_cb(data: *mut c_void, page: *const u8, page_len: c_int, page_no: c_int, frame_no: c_int) -> c_int {
+            let this = &mut *(data as *mut &mut dyn CheckpointCallback);
+            let ret = if page.is_null() {
+                this.finish()
+            } else {
+                this.frame(std::slice::from_raw_parts(page, page_len as _), NonZeroU32::new(page_no as _).unwrap(), NonZeroU32::new(frame_no as _).unwrap())
+            };
+
+            match ret {
+                Ok(()) => 0,
+                Err(e) => e.extended_code,
+            }
         }
 
         let handler = busy_handler
             .is_some()
-            .then_some(call_handler::<B> as unsafe extern "C" fn(*mut c_void) -> i32);
+            .then_some(call_handler as unsafe extern "C" fn(*mut c_void) -> i32);
         let handler_data = busy_handler
+            .as_mut()
             .map(|d| d as *mut _ as *mut _)
             .unwrap_or(std::ptr::null_mut());
+
+        let checkpoint_cb_fn = checkpoint_cb.is_some().then_some(call_cb as _);
+        let checkpoint_cb_data = checkpoint_cb.as_mut().map(|d| d as *mut &mut dyn CheckpointCallback as *mut _).unwrap_or(std::ptr::null_mut());
 
         let mut out_log_num_frames: c_int = 0;
         let mut out_backfilled: c_int = 0;
@@ -342,6 +389,8 @@ impl Wal for Sqlite3Wal {
                 buf.as_mut_ptr(),
                 &mut out_log_num_frames,
                 &mut out_backfilled,
+                checkpoint_cb_data,
+                checkpoint_cb_fn,
             )
         };
 
@@ -376,10 +425,24 @@ impl Wal for Sqlite3Wal {
         unsafe { (self.inner.methods.xCallback.unwrap())(self.inner.pData) }
     }
 
-    fn last_fame_index(&self) -> u32 {
+    fn last_fame_index(&self) -> Option<NonZeroU32> {
         unsafe {
             let wal = &*(self.inner.pData as *const sqlite3_wal);
-            wal.hdr.mxFrame
+            NonZeroU32::new(wal.hdr.mxFrame)
+        }
+    }
+
+    fn db_file(&self) -> &Sqlite3File {
+        unsafe {
+            let ptr = &mut (*(self.inner.pData as *mut sqlite3_wal)).pDbFd;
+            std::mem::transmute(ptr)
+        }
+    }
+
+    fn count_checkpointed(&self) -> u32 {
+        unsafe {
+            let ptr = &mut (*(self.inner.pData as *mut sqlite3_wal));
+            return libsql_ffi::sqlite3_wal_backfilled(ptr) as _;
         }
     }
 }

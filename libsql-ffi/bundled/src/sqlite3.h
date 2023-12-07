@@ -3806,6 +3806,9 @@ SQLITE_API int libsql_open_v3(
   libsql_wal_manager wal_manager   /* wal_manager instance, in charge of instanciating a wal */
 );
 
+typedef struct sqlite3_wal sqlite3_wal;
+SQLITE_API int sqlite3_wal_backfilled(sqlite3_wal *pWal);
+
 SQLITE_API LIBSQL_API int libsql_try_initialize_wasm_func_table(sqlite3 *db);
 
 /*
@@ -13466,8 +13469,7 @@ typedef struct libsql_wal_methods {
   /* Set the limiting size of a WAL file. */
   void (*xLimit)(wal_impl* pWal, long long limit);
 
-  /* Used by readers to open (lock) and close (unlock) a snapshot.  A
-  ** snapshot is like a read-transaction.  It is the state of the database
+  /* Used by readers to open (lock) and close (unlock) a snapshot.  A ** snapshot is like a read-transaction.  It is the state of the database
   ** at an instant in time.  sqlite3WalOpenSnapshot gets a read lock and
   ** preserves the current state even if the other threads or processes
   ** write to or checkpoint the WAL.  sqlite3WalCloseSnapshot() closes the
@@ -13512,7 +13514,9 @@ typedef struct libsql_wal_methods {
     int nBuf,                       /* Size of buffer nBuf */
     unsigned char *zBuf,                       /* Temporary buffer to use */
     int *pnLog,                     /* OUT: Number of frames in WAL */
-    int *pnCkpt                     /* OUT: Number of backfilled frames in WAL */
+    int *pnCkpt,                    /* OUT: Number of backfilled frames in WAL */
+    void* pCbData,
+    int (*xCb)(void*, const unsigned char*, int, int, int)
   );
 
   /* Return the value to pass to a sqlite3_wal_hook callback, the
@@ -13656,6 +13660,8 @@ typedef struct RefCountedWalManager {
 int make_ref_counted_wal_manager(libsql_wal_manager wal_manager, RefCountedWalManager **out);
 void destroy_wal_manager(RefCountedWalManager *p);
 RefCountedWalManager* clone_wal_manager(RefCountedWalManager *p);
+
+SQLITE_API int sqlite3_wal_backfilled(sqlite3_wal* pWal);
 
 RefCountedWalManager *make_sqlite3_wal_manager_rc();
 

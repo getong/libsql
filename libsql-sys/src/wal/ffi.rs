@@ -1,13 +1,14 @@
 use std::ffi::{c_char, c_int, c_longlong, c_void, CStr};
 use std::num::NonZeroU32;
+use std::ptr::null;
 
 use libsql_ffi::{
     libsql_wal, libsql_wal_manager, libsql_wal_methods, sqlite3, sqlite3_file, sqlite3_vfs,
     wal_impl, wal_manager_impl, PgHdr, SQLITE_CHECKPOINT_FULL, SQLITE_CHECKPOINT_PASSIVE,
-    SQLITE_CHECKPOINT_RESTART, SQLITE_CHECKPOINT_TRUNCATE, SQLITE_OK, WAL_SAVEPOINT_NDATA,
+    SQLITE_CHECKPOINT_RESTART, SQLITE_CHECKPOINT_TRUNCATE, SQLITE_OK, WAL_SAVEPOINT_NDATA, Error,
 };
 
-use crate::wal::{BusyHandler, CheckpointMode, UndoHandler};
+use crate::wal::{BusyHandler, CheckpointMode, UndoHandler, CheckpointCallback};
 
 use super::{PageHeaders, Sqlite3Db, Sqlite3File, Vfs, Wal, WalManager};
 
@@ -311,6 +312,8 @@ pub unsafe extern "C" fn checkpoint<T: Wal>(
     z_buf: *mut u8,
     frames_in_wal_out: *mut c_int,
     checkpointed_frames_out: *mut c_int,
+    checkpoint_cb_data: *mut c_void,
+    checkpoint_cb: Option<unsafe extern "C" fn (data: *mut c_void, page: *const u8, page_size: c_int, page_no: c_int, frame_no: c_int) -> c_int>,
 ) -> i32 {
     let this = &mut (*(wal as *mut T));
     struct SqliteBusyHandler {
@@ -324,7 +327,37 @@ pub unsafe extern "C" fn checkpoint<T: Wal>(
         }
     }
 
+    struct SqliteCheckpointCallback {
+        data: *mut c_void,
+        f: unsafe extern "C" fn (data: *mut c_void, page: *const u8, page_size: c_int, page_no: c_int, frame_no: c_int) -> c_int,
+    }
+
+    impl CheckpointCallback for SqliteCheckpointCallback {
+        fn frame(&mut self, page: &[u8], page_no: NonZeroU32, frame_no: NonZeroU32) -> crate::wal::Result<()> {
+            unsafe {
+                let rc = (self.f)(self.data, page.as_ptr(), page.len() as _, page_no.get() as _, frame_no.get() as _);
+                if rc == 0 {
+                    Ok(())
+                } else {
+                    Err(Error::new(rc))
+                }
+            }
+        }
+
+        fn finish(&mut self) -> crate::wal::Result<()> {
+            unsafe {
+                let rc = (self.f)(self.data, null(), 0, 0, 0);
+                if rc == 0 {
+                    Ok(())
+                } else {
+                    Err(Error::new(rc))
+                }
+            }
+        }
+    }
+
     let mut busy_handler = busy_handler.map(|f| SqliteBusyHandler { data: busy_arg, f });
+    let mut checkpoint_cb = checkpoint_cb.map(|f| SqliteCheckpointCallback { f, data: checkpoint_cb_data });
     let buf = std::slice::from_raw_parts_mut(z_buf, n_buf as usize);
 
     let mode = match emode {
@@ -336,7 +369,7 @@ pub unsafe extern "C" fn checkpoint<T: Wal>(
     };
 
     let mut db = Sqlite3Db { inner: db };
-    match this.checkpoint(&mut db, mode, busy_handler.as_mut(), sync_flags as _, buf) {
+    match this.checkpoint(&mut db, mode, busy_handler.as_mut().map(|x| x as _), sync_flags as _, buf, checkpoint_cb.as_mut().map(|x| x as _)) {
         Ok((frames_in_wal, backfilled_frames)) => {
             if !frames_in_wal_out.is_null() {
                 *frames_in_wal_out = frames_in_wal as _;

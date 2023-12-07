@@ -4,7 +4,7 @@ use std::num::NonZeroU32;
 use libsql_sys::ffi::PgHdr;
 use libsql_sys::wal::{
     BusyHandler, CheckpointMode, PageHeaders, Result, Sqlite3Db, Sqlite3File, Sqlite3Wal,
-    Sqlite3WalManager, UndoHandler, Vfs, Wal, WalManager,
+    Sqlite3WalManager, UndoHandler, Vfs, Wal, WalManager, CheckpointCallback,
 };
 
 use crate::frame::FrameBorrowed;
@@ -176,17 +176,18 @@ impl Wal for InjectorWal {
         }
     }
 
-    fn checkpoint<B: BusyHandler>(
+    fn checkpoint(
         &mut self,
         db: &mut Sqlite3Db,
         mode: CheckpointMode,
-        busy_handler: Option<&mut B>,
+        busy_handler: Option<&mut dyn BusyHandler>,
         sync_flags: u32,
         // temporary scratch buffer
         buf: &mut [u8],
+        checkpoint_cb: Option<&mut dyn CheckpointCallback>
     ) -> Result<(u32, u32)> {
         self.inner
-            .checkpoint(db, mode, busy_handler, sync_flags, buf)
+            .checkpoint(db, mode, busy_handler, sync_flags, buf, checkpoint_cb)
     }
 
     fn exclusive_mode(&mut self, op: c_int) -> Result<()> {
@@ -205,8 +206,16 @@ impl Wal for InjectorWal {
         self.inner.callback()
     }
 
-    fn last_fame_index(&self) -> u32 {
-        todo!()
+    fn last_fame_index(&self) -> Option<NonZeroU32> {
+        self.inner.last_fame_index()
+    }
+
+    fn db_file(&self) -> &Sqlite3File {
+        self.inner.db_file()
+    }
+
+    fn count_checkpointed(&self) -> u32 {
+        self.inner.count_checkpointed()
     }
 }
 
